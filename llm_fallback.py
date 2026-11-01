@@ -27,6 +27,7 @@ class FallbackLlm(GeneralLlm):
                            temperature=temperature, timeout=180, allowed_tries=1))
             for m in models]
         self._tries = tries_per_model
+        self._fb_base_url, self._fb_api_key, self._fb_temperature = base_url, api_key, temperature
         self._backoff = backoff_s
 
     async def invoke(self, prompt, system_prompt=None) -> str:

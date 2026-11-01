@@ -28,6 +28,12 @@ jobs:
           version: "0.13.1"
       - name: Install dependencies
         run: uv sync --locked
+      - name: Restore failure record
+        uses: actions/cache/restore@v4
+        with:
+          path: .bot_state
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
       - name: Run bot
         run: |
           uv run python main.py
@@ -47,4 +53,9 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
-          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}      - name: Save failure record
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .bot_state
+          key: bot-state-${{ github.run_id }}-${{ github.run_attempt }}

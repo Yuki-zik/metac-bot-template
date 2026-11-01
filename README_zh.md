@@ -63,6 +63,11 @@ LLM_BASE_URL=http://127.0.0.1:8765/v1 LLM_API_KEY=mock LLM_MODEL=mock uv run pyt
 - `TOURNAMENTS=33131` 可临时只跑指定赛事（逗号分隔 id/slug）。
 - 取舍：Market Pulse 为 spot scoring，只计收盘时的预测；当前每题只预测一次、不重复更新（省额度）。若额度充足，可考虑在临近收盘时重新预测以提高分数。
 
+### 失败处理（省额度）
+- 解析失败（回复里没有可解析的 JSON/百分位）：同模型加严格格式提醒重试 1 次 → 再换 `LLM_MODEL` 中下一个模型（`PARSE_FALLBACK_MODELS`，默认 1 个）；解析器自身不再盲目重试 3 次。最坏约 6 次请求/题。
+- 单题失败不再让整个 run 失败（记录日志、exit 0），结尾打印成功/失败数与 `LLM request count`。
+- 失败记录 `.bot_state/failures.json`（{question_id: [时间戳]}），通过 GitHub Actions `actions/cache` 在各次运行间保存；24 小时内失败 ≥ `MAX_FAILURES_PER_DAY`（默认 2）次的题会被跳过。dry run 默认不写此文件。
+
 ### 请求次数预算（OpenRouter 免费额度约 50 次/天；账户充值 ≥$10 后为 1000 次/天）
 - 默认不做联网调研（`RESEARCHER=no_research`，0 次请求）；每题 ≈ 1 次预测 + 1 次结构化解析，部分题型多 1 次，实测约 3 次/题 → 免费额度约够 15 道新题/天。
 - 失败（429/503/超时）时指数退避重试，每个模型 `LLM_TRIES_PER_MODEL`（默认 2）次，再回退到列表中下一个模型；重试也计入额度。

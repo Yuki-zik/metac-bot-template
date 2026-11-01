@@ -129,6 +129,44 @@ class FallTemplateBot2026(ForecastBot):
 
     ##################################### RESEARCH #####################################
 
+    _STRICT_REMINDER = (
+        "\n\nIMPORTANT FORMAT REMINDER: your previous answer could not be parsed. "
+        "Keep the reasoning short and END your reply with the final answer in EXACTLY "
+        "the format requested above (one value per line, plain numbers/dates, no ranges, "
+        "no extra text after it)."
+    )
+
+    async def _reason_and_parse(self, prompt: str, output_type, **parse_kwargs):
+        """Reason + parse with escalation on parse failure:
+        default LLM -> same LLM with strict format reminder -> each later fallback model
+        (with reminder). Returns (reasoning, parsed)."""
+        default = self.get_llm("default", "llm")
+        attempts = [(default, prompt, "default")]
+        attempts.append((default, prompt + self._STRICT_REMINDER, "default+strict"))
+        fb = getattr(default, "_fb_llms", None)
+        if fb and len(fb) > 1:
+            from llm_fallback import FallbackLlm
+            n_extra = int(os.getenv("PARSE_FALLBACK_MODELS", "1"))
+            for name, _ in fb[1:1 + n_extra]:
+                single = FallbackLlm([name], default._fb_base_url, default._fb_api_key,
+                                     temperature=default._fb_temperature,
+                                     tries_per_model=default._tries)
+                attempts.append((single, prompt + self._STRICT_REMINDER, name))
+        last = None
+        for llm, p, label in attempts:
+            try:
+                reasoning = await llm.invoke(p)
+                logger.info(f"Reasoning ({label}): {reasoning}")
+                kw = dict(parse_kwargs)
+                kw.setdefault("model", self.get_llm("parser", "llm"))
+                kw.setdefault("allowed_tries", 1)  # escalation below replaces blind parser retries
+                parsed = await structure_output(reasoning, output_type, **kw)
+                return reasoning, parsed
+            except Exception as e:  # noqa: BLE001
+                last = e
+                logger.warning(f"reason/parse attempt '{label}' failed: {str(e)[:200]}")
+        raise last
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             research = ""
@@ -236,16 +274,14 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a probability forecast for a binary question.
             {self._create_resolved_question_parsing_message()}
             """
         )
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning,
+        reasoning, binary_prediction = await self._reason_and_parse(
+            prompt,
             BinaryPrediction,
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
@@ -318,11 +354,9 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning,
-            output_type=PredictedOptionList,
+        reasoning, predicted_option_list = await self._reason_and_parse(
+            prompt,
+            PredictedOptionList,
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
@@ -401,8 +435,6 @@ class FallTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a forecast distribution for a numeric question.
@@ -418,8 +450,8 @@ class FallTemplateBot2026(ForecastBot):
             - Turn any values that are in scientific notation into regular numbers.
             """
         )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
+        reasoning, percentile_list = await self._reason_and_parse(
+            prompt,
             list[Percentile],
             model=self.get_llm("parser", "llm"),
             additional_instructions=parsing_instructions,
@@ -497,8 +529,6 @@ class FallTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a forecast distribution for a date question.
@@ -510,8 +540,8 @@ class FallTemplateBot2026(ForecastBot):
             - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
             """
         )
-        date_percentile_list: list[DatePercentile] = await structure_output(
-            reasoning,
+        reasoning, date_percentile_list = await self._reason_and_parse(
+            prompt,
             list[DatePercentile],
             model=self.get_llm("parser", "llm"),
             additional_instructions=parsing_instructions,
@@ -780,11 +810,37 @@ if __name__ == "__main__":
                                            and q.already_forecasted)]
             logger.info(f"Tournament {tid}: {len(tq)} open, {len(new_q)} not yet forecasted")
             qs += new_q
+        # Failure record: skip questions that already failed MAX_FAILURES_PER_DAY times
+        # in the last 24h (persisted across runs via actions/cache).
+        import json, time
+        fail_path = os.getenv("FAILURE_DB", ".bot_state/failures.json")
+        max_fail = int(os.getenv("MAX_FAILURES_PER_DAY", "2"))
+        try:
+            failures = json.load(open(fail_path))
+        except Exception:  # noqa: BLE001
+            failures = {}
+        now = time.time()
+        failures = {k: [t for t in v if now - t < 86400] for k, v in failures.items()}
+        failures = {k: v for k, v in failures.items() if v}
+        qkey = lambda q: str(q.id_of_question or q.id_of_post or q.page_url)
+        blocked = [q for q in qs if len(failures.get(qkey(q), [])) >= max_fail]
+        if blocked:
+            logger.info(f"Skipping {len(blocked)} question(s) that failed >= {max_fail}x in 24h: "
+                        + ", ".join(f"{q.page_url} (q{qkey(q)})" for q in blocked))
+        qs = [q for q in qs if q not in blocked]
         if max_q > 0:
             qs = qs[:max_q]
         logger.info(f"Forecasting {len(qs)} questions this run (cap={max_q or 'none'})")
         forecast_reports = asyncio.run(
             template_bot.forecast_questions(qs, return_exceptions=True))
+        for q, r in zip(qs, forecast_reports):
+            if isinstance(r, BaseException):
+                failures.setdefault(qkey(q), []).append(now)
+                logger.warning(f"Recorded failure for {q.page_url} (q{qkey(q)}): "
+                               f"{len(failures[qkey(q)])} in 24h")
+        if publish_to_metaculus or os.getenv("RECORD_FAILURES_IN_DRY_RUN") == "1":
+            os.makedirs(os.path.dirname(fail_path) or ".", exist_ok=True)
+            json.dump(failures, open(fail_path, "w"), indent=1)
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season
         # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
@@ -807,12 +863,19 @@ if __name__ == "__main__":
             )
         )
 
-    template_bot.log_report_summary(forecast_reports)
+    exit_note = None
+    try:
+        template_bot.log_report_summary(forecast_reports)
+    except Exception as e:  # noqa: BLE001  one failed question must not fail the run
+        exit_note = str(e)[:300]
+        logger.error(f"Some questions failed (run continues, exit 0): {exit_note}")
     print_run_summary_banner(
         forecast_reports,
         will_publish=publish_to_metaculus,
         tournament_url=TOURNAMENT_URLS.get(run_mode),
     )
+    n_fail = sum(isinstance(r, BaseException) for r in forecast_reports)
+    print(f"Submitted/produced: {len(forecast_reports) - n_fail}, failed: {n_fail}")
     try:
         from llm_fallback import REQUEST_COUNT
         print(f"LLM request count: {REQUEST_COUNT}")
