@@ -57,6 +57,12 @@ LLM_BASE_URL=http://127.0.0.1:8765/v1 LLM_API_KEY=mock LLM_MODEL=mock uv run pyt
 3. 打开 **Actions** 标签页，点击 “I understand my workflows, go ahead and enable them”；再进入 “Forecast on new AI tournament questions” 工作流，若显示定时任务已禁用则点 **Enable workflow**。
 4. 可先点 **Run workflow** 手动触发一次检查日志。工作流中**未设置 DRY_RUN**，会真实提交预测；定时为每 20 分钟（`7,27,47 * * * *`），已预测过的问题会被跳过。
 
+### 赛事范围（tournament 模式）
+- 依次抓取：Fall 2026 FutureEval → MiniBench → **Market Pulse Challenge 26Q4**（id `33131`，slug `market-pulse-26q4` 亦可；允许 bot 参赛，收盘时点评分）。
+- 已预测过的题自动跳过；每次运行最多 `MAX_QUESTIONS` 题（tournament 模式默认 5，`0`=不限），按上述优先级截断，避免重试烧光每日免费额度。
+- `TOURNAMENTS=33131` 可临时只跑指定赛事（逗号分隔 id/slug）。
+- 取舍：Market Pulse 为 spot scoring，只计收盘时的预测；当前每题只预测一次、不重复更新（省额度）。若额度充足，可考虑在临近收盘时重新预测以提高分数。
+
 ### 请求次数预算（OpenRouter 免费额度约 50 次/天；账户充值 ≥$10 后为 1000 次/天）
 - 默认不做联网调研（`RESEARCHER=no_research`，0 次请求）；每题 ≈ 1 次预测 + 1 次结构化解析，部分题型多 1 次，实测约 3 次/题 → 免费额度约够 15 道新题/天。
 - 失败（429/503/超时）时指数退避重试，每个模型 `LLM_TRIES_PER_MODEL`（默认 2）次，再回退到列表中下一个模型；重试也计入额度。

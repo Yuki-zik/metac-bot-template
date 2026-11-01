@@ -758,31 +758,33 @@ if __name__ == "__main__":
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
     client = MetaculusClient()
-    max_q = int(os.getenv("MAX_QUESTIONS", "0"))
-    if run_mode in ("tournament", "test_questions") and max_q > 0:
-        # Frugal mode (dry-run testing): only the first N open questions.
-        qs = []
-        tids = ((client.CURRENT_AI_COMPETITION_ID, client.CURRENT_MINIBENCH_ID)
+    # Market Pulse Challenge 26Q4 (bots allowed; spot scoring at close).
+    MARKET_PULSE_ID = 33131  # slug "market-pulse-26q4" also works
+    # Per-run cap protects the ~50 req/day free OpenRouter budget (~3 req/question).
+    # Tournament mode defaults to 5; 0 = unlimited.
+    max_q = int(os.getenv("MAX_QUESTIONS", "5" if run_mode == "tournament" else "0"))
+    if run_mode == "tournament" or (run_mode == "test_questions" and max_q > 0):
+        # Priority order: FutureEval, MiniBench, then Market Pulse.
+        tids = ((client.CURRENT_AI_COMPETITION_ID, client.CURRENT_MINIBENCH_ID, MARKET_PULSE_ID)
                 if run_mode == "tournament" else ("bot-testing-area",))
+        if os.getenv("TOURNAMENTS"):  # override, e.g. TOURNAMENTS=33131
+            tids = tuple(int(t) if t.isdigit() else t for t in os.environ["TOURNAMENTS"].split(","))
+        qs = []
         for tid in tids:
             try:
-                qs += client.get_all_open_questions_from_tournament(tid)
+                tq = client.get_all_open_questions_from_tournament(tid)
             except Exception as e:  # noqa: BLE001
                 logging.warning(f"could not list {tid}: {e}")
+                continue
+            new_q = [q for q in tq if not (template_bot.skip_previously_forecasted_questions
+                                           and q.already_forecasted)]
+            logger.info(f"Tournament {tid}: {len(tq)} open, {len(new_q)} not yet forecasted")
+            qs += new_q
+        if max_q > 0:
+            qs = qs[:max_q]
+        logger.info(f"Forecasting {len(qs)} questions this run (cap={max_q or 'none'})")
         forecast_reports = asyncio.run(
-            template_bot.forecast_questions(qs[:max_q], return_exceptions=True))
-    elif run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
-            )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
+            template_bot.forecast_questions(qs, return_exceptions=True))
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season
         # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
