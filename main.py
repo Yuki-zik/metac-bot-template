@@ -1,3 +1,4 @@
+import os
 import argparse
 import asyncio
 import logging
@@ -697,11 +698,26 @@ if __name__ == "__main__":
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
+    parser.add_argument("--dry-run", action="store_true",
+        help="Do NOT publish forecasts to Metaculus (also enabled by env DRY_RUN=1)")
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
+    # Zero-cost custom LLM: any OpenAI-compatible endpoint via env vars
+    # LLM_BASE_URL / LLM_API_KEY / LLM_MODEL (e.g. Qiniu Conatus free model).
+    custom_llms = None
+    if os.getenv("LLM_BASE_URL") and os.getenv("LLM_API_KEY") and os.getenv("LLM_MODEL"):
+        from llm_fallback import from_env
+        custom_llms = {"default": from_env(0.3), "summarizer": from_env(0.0),
+                       # no paid search: research step makes zero LLM calls by default
+                       "researcher": os.getenv("RESEARCHER", "no_research"),
+                       "parser": from_env(0.0)}
+        # frugal: 1 parse sample per prediction (template default 2)
+        FallTemplateBot2026._structure_output_validation_samples = 1
+        # satisfy the template's key check for the custom backend
+        os.environ.setdefault("OPENAI_API_KEY", os.environ["LLM_API_KEY"])
     check_environment(strict=True)
-    publish_to_metaculus = True
+    publish_to_metaculus = not (args.dry_run or os.getenv("DRY_RUN") == "1")
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     # Configure the bot. The `llms=` block below is commented out to use
@@ -709,12 +725,13 @@ if __name__ == "__main__":
     # uncomment and edit to pin specific models.
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=int(os.getenv("NUM_PREDICTIONS", "1" if custom_llms else "5")),
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
+        **({"llms": custom_llms} if custom_llms else {}),
         # llms={
         #     "default": GeneralLlm(
         #         model="openrouter/openai/gpt-4o",
@@ -741,7 +758,20 @@ if __name__ == "__main__":
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
     client = MetaculusClient()
-    if run_mode == "tournament":
+    max_q = int(os.getenv("MAX_QUESTIONS", "0"))
+    if run_mode in ("tournament", "test_questions") and max_q > 0:
+        # Frugal mode (dry-run testing): only the first N open questions.
+        qs = []
+        tids = ((client.CURRENT_AI_COMPETITION_ID, client.CURRENT_MINIBENCH_ID)
+                if run_mode == "tournament" else ("bot-testing-area",))
+        for tid in tids:
+            try:
+                qs += client.get_all_open_questions_from_tournament(tid)
+            except Exception as e:  # noqa: BLE001
+                logging.warning(f"could not list {tid}: {e}")
+        forecast_reports = asyncio.run(
+            template_bot.forecast_questions(qs[:max_q], return_exceptions=True))
+    elif run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
@@ -781,3 +811,8 @@ if __name__ == "__main__":
         will_publish=publish_to_metaculus,
         tournament_url=TOURNAMENT_URLS.get(run_mode),
     )
+    try:
+        from llm_fallback import REQUEST_COUNT
+        print(f"LLM request count: {REQUEST_COUNT}")
+    except Exception:
+        pass
